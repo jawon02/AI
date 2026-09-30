@@ -1,0 +1,16 @@
+# Python 가상환경 폴더
+venv/
+env/
+ENV/
+
+# 파이썬 캐시 파일
+__pycache__/
+*.py[cod]
+*$py.class
+
+# VS Code 설정 파일 (선택사항)
+.vscode/
+
+# 운영체제 생성 파일
+.DS_Store
+Thumbs.db
