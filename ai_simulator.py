@@ -10,6 +10,26 @@ model = YOLO("best (3).pt")
 print("=== AI 모델 로딩 완료! ===")
 
 def run_ai_simulator():
+    # [수정 포인트 1] 시뮬레이션 시작 전 서버 연결 상태를 단 한번 먼저 체크
+    print("=== 백엔드 서버 연결 상태 확인 중... ===")
+    is_server_online = True
+    
+    try:
+        # 루트 경로("/")로 가볍게 요청을 보내 서버 생존 여부 확인 (타임아웃 2초)
+        response = requests.get("http://127.0.0.1:8000/", timeout=2.0)
+        if response.status_code != 200:
+            is_server_online = False
+    except requests.exceptions.ConnectionError:
+        is_server_online = False
+
+    # 서버가 안 켜져있을 때 딱 한 번 로그를 띄우고 3초 대기
+    if not is_server_online:
+        print("[오류] 백엔드 서버와 연결할 수 없습니다.")
+        print("⏳ 3초 후 여기 코드 안에서만 독자적으로 시뮬레이션이 동작합니다...")
+        time.sleep(3)
+    else:
+        print("[성공] 백엔드 서버와 정상적으로 연결되었습니다!")
+
     print("=== 1초에 1프레임씩 분석하는 실시간 관제 시뮬레이터 시작 ===")
     
     video_path = "53125-472583428.mp4"
@@ -25,10 +45,6 @@ def run_ai_simulator():
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
-            #print("=== 동영상 재생 완료. 처음부터 다시 반복합니다. ===")
-            #cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # 영상이 끝나면 무한 반복
-            #continue
-
             print("=== 12초 동영상 분석이 완료되었습니다. 시뮬레이션을 종료합니다. ===")
             break  # <-- 반복을 멈추고 빠져나감
 
@@ -71,21 +87,29 @@ def run_ai_simulator():
                 "south_cars": max(2, car_count // 2)
             }
             
-            response = requests.post(SERVER_URL, json=payload)
-            
-            if response.status_code == 200:
-                res_json = response.json()
-                print(f"[전송 성공] 서버 응답 결과:")
-                print(f"  - 감지된 차량 수(AI): {car_count}대")
-                print(f"  - 제어 모드: {res_json.get('mode')}")
-                print(f"  - 신호 액션: {res_json.get('signal_action')}")
+            # 서버가 켜져있을 때만 POST 요청 시도
+            if is_server_online:
+                try:
+                    response = requests.post(SERVER_URL, json=payload, timeout=2.0)
+                    if response.status_code == 200:
+                        res_json = response.json()
+                        print(f"[전송 성공] 서버 응답 결과:")
+                        print(f"  - 감지된 차량 수(AI): {car_count}대")
+                        print(f"  - 제어 모드: {res_json.get('mode')}")
+                        print(f"  - 신호 액션: {res_json.get('signal_action')}")
+                    else:
+                        print(f"[전송 실패] 상태 코드: {response.status_code}")
+                except requests.exceptions.ConnectionError:
+                    # 실행 중에 서버가 갑자기 꺼진 경우 처리
+                    is_server_online = False
+                    print("[오류] 서버와의 연결이 끊어졌습니다. 지금부터 로컬 모드로 전환됩니다.")
             else:
-                print(f"[전송 실패] 상태 코드: {response.status_code}")
+                # 서버가 애초에 없거나 꺼져있어서 로컬 코드 안에서만 도는 상황
+                print(f"[로컬 모드 동작] 감지된 차량 수(AI): {car_count}대 (서버 미연동)")
 
-        except requests.exceptions.ConnectionError:
-            print("[오류] 백엔드 서버와 연결할 수 없습니다.")
         except Exception as e:
             print(f"[오류 발생]: {e}")
+            time.sleep(1)
 
         # 시연할 때 눈으로 확인하기 좋게 1초 대기
         time.sleep(1)
