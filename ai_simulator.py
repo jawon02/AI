@@ -51,6 +51,17 @@ def run_ai_simulator():
                 if detected_boxes is not None:
                     car_count = len(detected_boxes)
 
+                # 바운딩 박스가 그려진 이미지(프레임) 생성
+                annotated_frame = r.plot()
+
+                # 창 크기를 임의로 조절할 수 있도록 설정
+                cv2.namedWindow("YOLO Traffic Detection", cv2.WINDOW_NORMAL)
+                cv2.resizeWindow("YOLO Traffic Detection", 800, 450)  # 창 크기 조절
+
+                # 컴퓨터 화면에 팝업 창으로 시각화해서 띄우기
+                cv2.imshow("YOLO Traffic Detection", annotated_frame)
+                cv2.waitKey(1) # 창이 꺼지지 않고 부드럽게 갱신되도록 대기
+
             payload = {
                 "pedestrian_count": 0,
                 "exit_congested": (car_count > 15),
