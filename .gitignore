@@ -14,3 +14,7 @@ __pycache__/
 # 운영체제 생성 파일
 .DS_Store
 Thumbs.db
+
+# AI 모델 및 대용량 동영상 파일 제외
+*.pt
+*.mp4
