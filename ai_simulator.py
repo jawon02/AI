@@ -41,7 +41,7 @@ JPEG_QUALITY = 60
 
 # Number of recent inference results used to stabilize counts/status.
 SMOOTHING_WINDOW = 5
-ACCIDENT_VOTES_REQUIRED = 3  # accident  must be seen in >=3 of last 5 inference results
+ACCIDENT_VOTES_REQUIRED = 3  # accident must be seen in >=3 of last 5 inference results
 CONGESTION_THRESHOLD = 15
 
 # ---------------------------------------------------------------------------
@@ -85,6 +85,9 @@ stable_accident_detected = False
 # Latest annotated frame and metrics read by the backend worker.
 latest_backend_frame = None
 latest_metrics = None
+
+# [영상 1회차 완료 및 SUMO 데이터 중단용 플래그]
+first_loop_done = False
 
 # Updated only by the inference worker.
 total_count_history = deque(maxlen=SMOOTHING_WINDOW)
@@ -199,6 +202,7 @@ def ai_inference_worker():
 def network_send_worker(server_online):
     """Send the latest annotated JPEG frame and stable metrics about once per second."""
     global latest_backend_frame, latest_metrics, is_running
+    global first_loop_done
 
     if not server_online:
         return
@@ -209,12 +213,13 @@ def network_send_worker(server_online):
         if not is_running:
             break
 
-        # Take a consistent snapshot of the newest annotated frame and metrics.
+        # Take a snapshot of frame and current status
         with state_lock:
             frame = latest_backend_frame.copy() if latest_backend_frame is not None else None
             metrics = dict(latest_metrics) if latest_metrics is not None else None
+            stop_sumo_data = first_loop_done
 
-        if frame is None or metrics is None:
+        if frame is None:
             continue
 
         try:
@@ -231,34 +236,49 @@ def network_send_worker(server_online):
 
             image_frame = base64.b64encode(jpeg_buffer.tobytes()).decode("utf-8")
 
-            cnt = metrics["vehicle_count"]
-            payload = {
-                "pedestrian_count": 0,
-                "exit_congested": cnt > CONGESTION_THRESHOLD,
-                "accident_detected": metrics["accident_status"],
-                "emergency_detected": False,
-                
-                # [4방향 차량 수 비중 설정]
-                # 남북 방향에 비중을 높게 주어 백엔드에서 CONGESTION_PATTERN이 발동되도록 전달
-                "north_cars": cnt,                       # 예: 12대
-                "south_cars": max(2, cnt // 2),           # 예: 6대
-                "east_cars": max(1, cnt // 3),            # 예: 4대
-                "west_cars": max(1, cnt // 4),            # 예: 3대
-                
-                "vehicle_count": cnt,
-                "image_frame": image_frame,
-            }
-
-
+            if stop_sumo_data:
+                # ⭕ [영상 반복 지점 이후]: 관제 화면용 영상(image_frame)만 보내고 SUMO 수치 데이터는 보내지 않음
+                payload = {
+                    "image_frame": image_frame
+                }
+                log_msg = f"[백엔드 영상 전송] (1회차 완료: SUMO 수치 전송 중단) | 프레임={JPEG_WIDTH}x{JPEG_HEIGHT}"
+            else:
+                # ⭕ [1회차 재생 중 (약 12초)]: 프레임 단위 실시간 분석 수치 + 영상 함께 전송
+                if metrics is None:
+                    continue
+                cnt = metrics["vehicle_count"]
+                payload = {
+                    "pedestrian_count": 0,
+                    "exit_congested": cnt > CONGESTION_THRESHOLD,
+                    "accident_detected": metrics["accident_status"],
+                    "emergency_detected": False,
+                    
+                    # [4방향 차량 수 비중 설정]
+                    "north_cars": 0,
+                    "south_cars": 0,
+                    "east_cars": cnt // 2,        
+                    "west_cars": cnt // 2,
+                    
+                    # [4방향 차량 수 비중 설정]
+                    #"north_cars": cnt,                       # 예: 12대
+                    #"south_cars": max(2, cnt // 2),           # 예: 6대
+                    #"east_cars": max(1, cnt // 3),            # 예: 4대
+                    #"west_cars": max(1, cnt // 4),            # 예: 3대
+                    
+                    
+                    "vehicle_count": cnt,
+                    "image_frame": image_frame,
+                }
+                log_msg = (
+                    f"[백엔드 영상+데이터 전송] 전체 차량={payload['vehicle_count']} | "
+                    f"혼잡={payload['exit_congested']} | 사고={payload['accident_detected']} | "
+                    f"프레임={JPEG_WIDTH}x{JPEG_HEIGHT}"
+                )
 
             response = session.post(SERVER_URL, json=payload, timeout=(1.0, 3.0))
             response.raise_for_status()
-            print(
-                "[백엔드 영상+데이터 전송] "
-                f"전체 차량={payload['vehicle_count']} | "
-                f"혼잡={payload['exit_congested']} | 사고={payload['accident_detected']} | "
-                f"프레임={JPEG_WIDTH}x{JPEG_HEIGHT}"
-            )
+            print(log_msg)
+
         except requests.RequestException as exc:
             print(f"[백엔드 전송 실패] {exc}")
         except Exception as exc:
@@ -282,6 +302,7 @@ def check_server():
 
 def run_ai_simulator():
     global latest_frame, latest_frame_seq, latest_backend_frame, latest_metrics, is_running
+    global first_loop_done
 
     is_running = True
     server_online = check_server()
@@ -319,9 +340,14 @@ def run_ai_simulator():
 
             if not ret or frame is None:
                 print(
-                    f"=== 동영상 재생 완료 ({time.time() - start_sim_time:.2f}초). "
-                    "처음부터 다시 재생합니다. ==="
+                    f"=== 동영상 1회 재생 완료 ({time.time() - start_sim_time:.2f}초). "
+                    "이제 SUMO 데이터 전송은 멈추고 관제 화면용 영상만 계속 송출합니다. ==="
                 )
+                
+                # ⭕ 영상이 한 바퀴 다 돈 지점에서 플래그를 True로 변경
+                with state_lock:
+                    first_loop_done = True
+
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = cap.read()
                 if not ret or frame is None:
