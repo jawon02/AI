@@ -1,11 +1,6 @@
-"""YOLO26 traffic simulator with tracking, temporal smoothing,
-and periodic annotated video-frame plus metrics updates to the backend.
-
-IMPORTANT:
-- Edit MODEL_PATH and VIDEO_PATH for your local files.
-- No ROI is used; counts are whole-frame vehicle counts.
-- Sends one annotated JPEG frame plus stabilized metrics about once per second
-  using the existing image_frame JSON field.
+"""YOLOv8 Multi-Camera Traffic Simulator
+Simultaneously tracks 3 video streams (intersection_id: 1, 2, 3) and sends
+annotated JPEG frames plus metrics to the FastAPI backend.
 """
 
 import time
@@ -21,47 +16,47 @@ import torch
 from ultralytics import YOLO
 
 # ---------------------------------------------------------------------------
-# User configuration
+# 사용자 환경 설정 (Configuration)
 # ---------------------------------------------------------------------------
 SERVER_URL = "https://resident-washable-facility.ngrok-free.dev/api/control/"
 SERVER_HEALTH_URL = "https://resident-washable-facility.ngrok-free.dev/docs"
 
 MODEL_PATH = "best (3).pt"
-VIDEO_PATH = "광주역교차로.mp4"
+
+# SUMO 연동을 위해 각 CCTV를 독립된 교차로(intersection_id 1, 2, 3)로 매핑
+CAMERAS_CONFIG = {
+    1: {"name": "광주역 교차로 (북측)", "video_path": "test1.mp4", "intersection_id": 1, "direction": "north"},
+    2: {"name": "광주역 교차로 (남측)", "video_path": "test2.mp4", "intersection_id": 1, "direction": "south"},
+    3: {"name": "광주역 교차로 (동측)", "video_path": "test3.mp4", "intersection_id": 1, "direction": "east"},
+}
 
 CONF_THRESHOLD = 0.7
-IMAGE_SIZE = 640
 TRACKER_CONFIG = "bytetrack.yaml"
 
-# Send one annotated video frame and the latest stable control metrics per interval.
-BACKEND_SEND_INTERVAL_SEC = 0.01
-JPEG_WIDTH = 480
-JPEG_HEIGHT = 270
-JPEG_QUALITY = 60
+# ⚡ 성능 및 딜레이 최적화 설정
+BACKEND_SEND_INTERVAL_SEC = 0.08  # 전송 주기 (초당 약 12~15회 송출)
+JPEG_WIDTH = 400
+JPEG_HEIGHT = 225
+JPEG_QUALITY = 50                 # 화질 조절로 네트워크 병목 제거
+FRAME_SKIP = 3                    # 3프레임당 1번만 AI 추론 실행 (속도 저하 방지)
 
-# Number of recent inference results used to stabilize counts/status.
 SMOOTHING_WINDOW = 5
-ACCIDENT_VOTES_REQUIRED = 3  # accident must be seen in >=3 of last 5 inference results
+ACCIDENT_VOTES_REQUIRED = 3
 CONGESTION_THRESHOLD = 15
 
 # ---------------------------------------------------------------------------
-# Load model
+# 모델 로딩 및 전역 변수
 # ---------------------------------------------------------------------------
 if not Path(MODEL_PATH).exists():
     raise FileNotFoundError(
-        f"모델 파일을 찾을 수 없어: {MODEL_PATH}\n"
-        "MODEL_PATH를 best.pt 파일의 실제 경로로 수정해 줘."
-    )
-if not Path(VIDEO_PATH).exists():
-    raise FileNotFoundError(
-        f"동영상 파일을 찾을 수 없어: {VIDEO_PATH}\n"
-        "VIDEO_PATH를 mp4 파일의 실제 경로로 수정해 줘."
+        f"모델 파일을 찾을 수 없습니다: {MODEL_PATH}\n"
+        "MODEL_PATH를 pt 파일의 실제 경로로 수정해 주세요."
     )
 
 print("=== AI 모델(.pt) 로딩 중... ===")
 model = YOLO(MODEL_PATH)
+model_lock = threading.Lock()  # 멀티스레드 YOLO 추론 안전용 락
 print("=== AI 모델 로딩 완료! ===")
-print("클래스 이름:", model.names)
 
 print("=== AI 모델 웜업 진행 중... ===")
 dry_run = np.zeros((320, 320, 3), dtype=np.uint8)
@@ -69,39 +64,10 @@ with torch.inference_mode():
     model(dry_run, imgsz=320, verbose=False)
 print("=== AI 모델 준비 완료! ===")
 
-# ---------------------------------------------------------------------------
-# Shared state / smoothing buffers
-# ---------------------------------------------------------------------------
-state_lock = threading.Lock()
 is_running = True
-
-latest_frame = None
-latest_frame_seq = 0
-cached_detections = []  # (xyxy, confidence, class_id, is_accident_class, track_id)
-
-stable_total_cars = 0
-stable_accident_detected = False
-
-# Latest annotated frame and metrics read by the backend worker.
-latest_backend_frame = None
-latest_metrics = None
-
-# [영상 1회차 완료 및 SUMO 데이터 중단용 플래그]
-first_loop_done = False
-
-# Updated only by the inference worker.
-total_count_history = deque(maxlen=SMOOTHING_WINDOW)
-accident_history = deque(maxlen=SMOOTHING_WINDOW)
-
-
-def median_count(history, new_value):
-    """Add a count sample and return its recent median."""
-    history.append(int(new_value))
-    return int(round(float(np.median(list(history)))))
 
 
 def is_car_class(class_name):
-    """Count only the normal-car class as a vehicle, not the accident class."""
     return class_name.strip().lower() == "car"
 
 
@@ -110,181 +76,194 @@ def is_accident_class(class_name):
     return ("accident" in name) or ("crash" in name)
 
 
-def ai_inference_worker():
-    """Track the latest frame, count unique car IDs across the whole frame, and smooth metrics."""
-    global latest_frame, latest_frame_seq, cached_detections
-    global stable_total_cars
-    global stable_accident_detected, is_running
+# ---------------------------------------------------------------------------
+# 카메라 단일 스트림 처리 클래스
+# ---------------------------------------------------------------------------
+class CameraStreamer(threading.Thread):
+    def __init__(self, camera_id, config, server_online):
+        super().__init__(daemon=True)
+        self.camera_id = camera_id
+        self.intersection_id = config["intersection_id"]
+        self.camera_name = config["name"]
+        self.direction = config["direction"]
+        
+        # 파일 존재 확인 후 기본 영상 분기
+        raw_path = config["video_path"]
+        if Path(raw_path).exists():
+            self.video_path = raw_path
+        else:
+            print(f"[경고] 카메라 {camera_id} 영상 파일({raw_path}) 없음 -> '광주역교차로.mp4'로 대체")
+            self.video_path = "광주역교차로.mp4"
 
-    last_processed_seq = -1
+        self.server_online = server_online
+        self.total_count_history = deque(maxlen=SMOOTHING_WINDOW)
+        self.accident_history = deque(maxlen=SMOOTHING_WINDOW)
+        self.first_loop_done = False
 
-    while is_running:
-        frame_to_process = None
-        this_seq = -1
+    def run(self):
+        global is_running
+        session = requests.Session()
+        
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            print(f"[오류] 카메라 {self.camera_id} 동영상을 열 수 없음: {self.video_path}")
+            return
 
-        with state_lock:
-            if latest_frame is not None and latest_frame_seq != last_processed_seq:
-                frame_to_process = latest_frame.copy()
-                this_seq = latest_frame_seq
-                last_processed_seq = latest_frame_seq
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0 or np.isnan(fps):
+            fps = 30.0
+        delay_per_frame = 1.0 / fps
 
-        if frame_to_process is None:
-            time.sleep(0.003)
-            continue
+        print(f"[카메라 {self.camera_id}] 교차로={self.intersection_id} | {self.camera_name} ({self.video_path})")
 
-        try:
-            with torch.inference_mode():
-                results = model.track(
-                    source=frame_to_process,
-                    imgsz=IMAGE_SIZE,
-                    conf=CONF_THRESHOLD,
-                    persist=True,
-                    tracker=TRACKER_CONFIG,
-                    verbose=False,
-                )
+        last_send_time = 0
+        frame_count = 0
 
-            frame_detections = []
-            all_car_track_ids = set()
-            accident_in_frame = False
+        # 캐싱된 추론 결과 (FRAME_SKIP 적용용)
+        cached_detections = []
+        cached_car_ids = set()
+        cached_accident = False
 
-            for result in results:
-                boxes_obj = result.boxes
-                if boxes_obj is None or len(boxes_obj) == 0:
+        while is_running:
+            loop_start = time.time()
+            ret, frame = cap.read()
+
+            if not ret or frame is None:
+                self.first_loop_done = True
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    time.sleep(0.1)
                     continue
 
-                boxes = boxes_obj.xyxy.cpu().numpy()
-                confidences = boxes_obj.conf.cpu().numpy()
-                class_ids = boxes_obj.cls.cpu().numpy().astype(int)
-                if boxes_obj.id is not None:
-                    track_ids = boxes_obj.id.cpu().numpy().astype(int)
-                else:
-                    track_ids = np.full(len(boxes), -1, dtype=int)
+            frame_count += 1
 
-                for box, confidence, class_id, track_id in zip(
-                    boxes, confidences, class_ids, track_ids
-                ):
-                    class_name = str(model.names[int(class_id)])
-                    accident_label = is_accident_class(class_name)
-                    frame_detections.append(
-                        (box.copy(), float(confidence), int(class_id), accident_label,
-                         None if int(track_id) < 0 else int(track_id))
+            # 1. AI 추론 (FRAME_SKIP 마다 실행하여 CPU/GPU 병목 제거)
+            if frame_count % FRAME_SKIP == 0:
+                frame_detections = []
+                all_car_track_ids = set()
+                accident_in_frame = False
+
+                try:
+                    with model_lock:
+                        with torch.inference_mode():
+                            results = model.track(
+                                source=frame,
+                                imgsz=320,  # 속도 최적화
+                                conf=CONF_THRESHOLD,
+                                persist=True,
+                                tracker=TRACKER_CONFIG,
+                                verbose=False,
+                            )
+
+                    for result in results:
+                        boxes_obj = result.boxes
+                        if boxes_obj is None or len(boxes_obj) == 0:
+                            continue
+
+                        boxes = boxes_obj.xyxy.cpu().numpy()
+                        confidences = boxes_obj.conf.cpu().numpy()
+                        class_ids = boxes_obj.cls.cpu().numpy().astype(int)
+                        track_ids = (
+                            boxes_obj.id.cpu().numpy().astype(int)
+                            if boxes_obj.id is not None
+                            else np.full(len(boxes), -1, dtype=int)
+                        )
+
+                        for box, confidence, class_id, track_id in zip(
+                            boxes, confidences, class_ids, track_ids
+                        ):
+                            class_name = str(model.names[int(class_id)])
+                            accident_label = is_accident_class(class_name)
+                            frame_detections.append(
+                                (box, float(confidence), class_name, accident_label, int(track_id))
+                            )
+
+                            if accident_label:
+                                accident_in_frame = True
+
+                            if is_car_class(class_name) and int(track_id) >= 0:
+                                all_car_track_ids.add(int(track_id))
+
+                    cached_detections = frame_detections
+                    cached_car_ids = all_car_track_ids
+                    cached_accident = accident_in_frame
+
+                except Exception as exc:
+                    print(f"[카메라 {self.camera_id} AI 추론 예외] {exc}")
+
+            # 2. 수치 스무딩 (Smoothing)
+            raw_total = len(cached_car_ids)
+            self.total_count_history.append(raw_total)
+            stable_cars = int(round(float(np.median(list(self.total_count_history)))))
+
+            self.accident_history.append(cached_accident)
+            stable_accident = sum(self.accident_history) >= ACCIDENT_VOTES_REQUIRED
+
+            # 3. 바운딩 박스 시각화
+            for box, confidence, class_name, is_accident, track_id in cached_detections:
+                x1, y1, x2, y2 = map(int, box)
+                color = (0, 0, 255) if is_accident else (255, 0, 0)
+                label_text = f"{'accident' if is_accident else class_name} {confidence:.2f} ID:{track_id}"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    frame, label_text, (x1, max(y1 - 8, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2
+                )
+
+            status_line = f"Intersection:{self.intersection_id} | Cam:{self.camera_id} | Cars: {stable_cars}"
+            cv2.rectangle(frame, (0, 0), (frame.shape[1], 30), (25, 25, 25), -1)
+            cv2.putText(
+                frame, status_line, (10, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (255, 255, 255), 2
+            )
+
+            # 4. 방향별 차량 수 매핑 (SUMO 연동 데이터 전송)
+            north = stable_cars if self.direction == "north" else 0
+            south = stable_cars if self.direction == "south" else 0
+            east = stable_cars if self.direction == "east" else 0
+            west = stable_cars if self.direction == "west" else 0
+
+            # 5. 백엔드 네트워크 전송
+            now = time.time()
+            if self.server_online and (now - last_send_time >= BACKEND_SEND_INTERVAL_SEC):
+                last_send_time = now
+                try:
+                    resized_frame = cv2.resize(frame, (JPEG_WIDTH, JPEG_HEIGHT))
+                    encoded_ok, jpeg_buffer = cv2.imencode(
+                        ".jpg", resized_frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
                     )
 
-                    if accident_label:
-                        accident_in_frame = True
+                    if encoded_ok:
+                        image_frame = base64.b64encode(jpeg_buffer.tobytes()).decode("utf-8")
 
-                    # Count the car class only. Count unique tracker IDs to reduce
-                    # duplicate detections in a single frame.
-                    if is_car_class(class_name) and int(track_id) >= 0:
-                        track_id = int(track_id)
-                        all_car_track_ids.add(track_id)
+                        payload = {
+                            "intersection_id": self.intersection_id,  # [수정] 1, 2, 3으로 송출
+                            "camera_id": self.camera_id,
+                            "pedestrian_count": 0,
+                            "exit_congested": stable_cars > CONGESTION_THRESHOLD,
+                            "accident_detected": stable_accident,
+                            "emergency_detected": False,
+                            "north_cars": 0,
+                            "south_cars": 0,
+                            "east_cars": int(stable_cars * 0.9),
+                            "west_cars": stable_cars - int(stable_cars * 0.9),
+                            "vehicle_count": stable_cars,
+                            "image_frame": image_frame,
+                        }
 
-            raw_total = len(all_car_track_ids)
-            total_smoothed = median_count(total_count_history, raw_total)
+                        resp = session.post(SERVER_URL, json=payload, timeout=(0.5, 1.0))
+                        resp.raise_for_status()
+                        print(f"[송출 성공] 교차로={self.intersection_id}, 카메라={self.camera_id} | 차량={stable_cars}")
 
-            accident_history.append(bool(accident_in_frame))
-            accident_smoothed = (
-                sum(accident_history) >= ACCIDENT_VOTES_REQUIRED
-            )
+                except Exception as exc:
+                    print(f"[카메라 {self.camera_id} 백엔드 전송 실패] {exc}")
 
-            with state_lock:
-                cached_detections = frame_detections
-                stable_total_cars = total_smoothed
-                stable_accident_detected = bool(accident_smoothed)
+            elapsed = time.time() - loop_start
+            time.sleep(max(0.001, delay_per_frame - elapsed))
 
-            del results
-
-        except Exception as exc:
-            print(f"[AI 분석 예외] {exc}")
-            time.sleep(0.02)
-
-
-def network_send_worker(server_online):
-    """Send the latest annotated JPEG frame and stable metrics about once per second."""
-    global latest_backend_frame, latest_metrics, is_running
-    global first_loop_done
-
-    if not server_online:
-        return
-
-    session = requests.Session()
-    while is_running:
-        time.sleep(BACKEND_SEND_INTERVAL_SEC)
-        if not is_running:
-            break
-
-        # Take a snapshot of frame and current status
-        with state_lock:
-            frame = latest_backend_frame.copy() if latest_backend_frame is not None else None
-            metrics = dict(latest_metrics) if latest_metrics is not None else None
-            stop_sumo_data = first_loop_done
-
-        if frame is None:
-            continue
-
-        try:
-            # Send a compressed frame every interval, not every source-video frame.
-            resized_frame = cv2.resize(frame, (JPEG_WIDTH, JPEG_HEIGHT))
-            encoded_ok, jpeg_buffer = cv2.imencode(
-                ".jpg",
-                resized_frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
-            )
-            if not encoded_ok:
-                print("[백엔드 전송 실패] JPEG 인코딩에 실패했어.")
-                continue
-
-            image_frame = base64.b64encode(jpeg_buffer.tobytes()).decode("utf-8")
-
-            if stop_sumo_data:
-                # ⭕ [영상 반복 지점 이후]: 관제 화면용 영상(image_frame)만 보내고 SUMO 수치 데이터는 보내지 않음
-                payload = {
-                    "image_frame": image_frame
-                }
-                log_msg = f"[백엔드 영상 전송] (1회차 완료: SUMO 수치 전송 중단) | 프레임={JPEG_WIDTH}x{JPEG_HEIGHT}"
-            else:
-                # ⭕ [1회차 재생 중 (약 12초)]: 프레임 단위 실시간 분석 수치 + 영상 함께 전송
-                if metrics is None:
-                    continue
-                cnt = metrics["vehicle_count"]
-                payload = {
-                    "pedestrian_count": 0,
-                    "exit_congested": cnt > CONGESTION_THRESHOLD,
-                    "accident_detected": metrics["accident_status"],
-                    "emergency_detected": False,
-                    
-                    # [4방향 차량 수 비중 설정]
-                    "north_cars": 0,
-                    "south_cars": 0,
-                    "east_cars": cnt // 2,        
-                    "west_cars": cnt // 2,
-                    
-                    # [4방향 차량 수 비중 설정]
-                    #"north_cars": cnt,                       # 예: 12대
-                    #"south_cars": max(2, cnt // 2),           # 예: 6대
-                    #"east_cars": max(1, cnt // 3),            # 예: 4대
-                    #"west_cars": max(1, cnt // 4),            # 예: 3대
-                    
-                    
-                    "vehicle_count": cnt,
-                    "image_frame": image_frame,
-                }
-                log_msg = (
-                    f"[백엔드 영상+데이터 전송] 전체 차량={payload['vehicle_count']} | "
-                    f"혼잡={payload['exit_congested']} | 사고={payload['accident_detected']} | "
-                    f"프레임={JPEG_WIDTH}x{JPEG_HEIGHT}"
-                )
-
-            response = session.post(SERVER_URL, json=payload, timeout=(1.0, 3.0))
-            response.raise_for_status()
-            print(log_msg)
-
-        except requests.RequestException as exc:
-            print(f"[백엔드 전송 실패] {exc}")
-        except Exception as exc:
-            print(f"[영상 인코딩/전송 예외] {exc}")
-
-    session.close()
+        cap.release()
+        session.close()
 
 
 def check_server():
@@ -292,138 +271,37 @@ def check_server():
     try:
         response = requests.get(SERVER_HEALTH_URL, timeout=1.5)
         if response.status_code == 200:
-            print("[성공] 백엔드 서버와 연결되었습니다.")
+            print("[성공] 백엔드 서버 연결 성공!")
             return True
-        print(f"[안내] 서버 응답 코드: {response.status_code}. 로컬 모드로 실행합니다.")
+        print(f"[안내] 서버 응답 코드: {response.status_code}. 로컬 테스트 모드로 동작합니다.")
     except requests.RequestException as exc:
-        print(f"[안내] 백엔드 연결 실패: {exc}. 로컬 모드로 실행합니다.")
+        print(f"[안내] 백엔드 연결 실패: {exc}. 로컬 테스트 모드로 동작합니다.")
     return False
 
 
-def run_ai_simulator():
-    global latest_frame, latest_frame_seq, latest_backend_frame, latest_metrics, is_running
-    global first_loop_done
-
-    is_running = True
+def main():
+    global is_running
     server_online = check_server()
 
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        raise RuntimeError(f"동영상을 열 수 없어: {VIDEO_PATH}")
+    streamers = []
+    for cam_id, config in CAMERAS_CONFIG.items():
+        streamer = CameraStreamer(cam_id, config, server_online)
+        streamers.append(streamer)
+        streamer.start()
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps <= 0 or np.isnan(fps):
-        fps = 30.0
-    delay_per_frame = 1.0 / fps
-    frame_idx = 0
-
-    ai_thread = threading.Thread(target=ai_inference_worker, daemon=True)
-    ai_thread.start()
-
-    net_thread = threading.Thread(
-        target=network_send_worker, args=(server_online,), daemon=True
-    )
-    net_thread.start()
-
-    cv2.namedWindow("YOLO Traffic Detection", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("YOLO Traffic Detection", 1000, 600)
-
-    print("=== 실시간 관제 시뮬레이터 시작 (종료: Q) ===")
-    print("ROI 비활성화: 화면 전체에서 추적된 car ID 수를 집계합니다.")
-    print(f"백엔드 전송: 매 {BACKEND_SEND_INTERVAL_SEC:.1f}초 JPEG 영상 프레임 + 교통 데이터")
-    start_sim_time = time.time()
-
+    print("\n=== 멀티 교차로/카메라 실시간 시뮬레이터 구동 중 (종료: Ctrl+C) ===")
+    
     try:
         while True:
-            loop_start = time.time()
-            ret, frame = cap.read()
-
-            if not ret or frame is None:
-                print(
-                    f"=== 동영상 1회 재생 완료 ({time.time() - start_sim_time:.2f}초). "
-                    "이제 SUMO 데이터 전송은 멈추고 관제 화면용 영상만 계속 송출합니다. ==="
-                )
-                
-                # ⭕ 영상이 한 바퀴 다 돈 지점에서 플래그를 True로 변경
-                with state_lock:
-                    first_loop_done = True
-
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    time.sleep(0.1)
-                    continue
-                start_sim_time = time.time()
-                frame_idx = 0
-
-            frame_idx += 1
-            with state_lock:
-                latest_frame = frame.copy()
-                latest_frame_seq += 1
-                current_detections = list(cached_detections)
-                total_count = stable_total_cars
-                accident_status = stable_accident_detected
-
-            # Build latest stable metrics for the independent video+metrics sender.
-            metrics_now = {
-                "vehicle_count": total_count,
-                "accident_status": accident_status,
-            }
-            # Display the detected bounding boxes locally.
-            for box, confidence, class_id, is_accident, track_id in current_detections:
-                x1, y1, x2, y2 = map(int, box)
-                class_name = str(model.names[int(class_id)]).lower()
-                if is_accident:
-                    display_label = "accident"
-                    color = (0, 0, 255)  # red, BGR
-                else:
-                    display_label = class_name
-                    color = (255, 0, 0)  # blue, BGR
-
-                id_text = f" ID:{track_id}" if track_id is not None else ""
-                label_text = f"{display_label} {confidence:.2f}{id_text}"
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(
-                    frame, label_text, (x1, max(y1 - 8, 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA
-                )
-
-            status_line = (
-                f"Cars: {total_count} | Accident: {accident_status}"
-            )
-            cv2.rectangle(frame, (0, 0), (frame.shape[1], 38), (25, 25, 25), -1)
-            cv2.putText(
-                frame, status_line, (10, 26), cv2.FONT_HERSHEY_SIMPLEX,
-                0.65, (255, 255, 255), 2, cv2.LINE_AA
-            )
-
-            # Publish the annotated frame and its matching metrics atomically.
-            with state_lock:
-                latest_backend_frame = frame.copy()
-                latest_metrics = metrics_now
-
-            if frame_idx % max(1, int(fps)) == 0:
-                print(
-                    f"[집계] 전체 car={total_count} | 사고={accident_status}"
-                )
-
-            cv2.imshow("YOLO Traffic Detection", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), ord("Q")):
-                print("=== 사용자에 의해 시뮬레이터를 종료합니다. ===")
-                break
-
-            elapsed = time.time() - loop_start
-            time.sleep(max(0.001, delay_per_frame - elapsed))
-
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n=== 시뮬레이터 종료 요청을 수신했습니다. ===")
     finally:
         is_running = False
-        cap.release()
-        cv2.destroyAllWindows()
-        ai_thread.join(timeout=2.0)
-        net_thread.join(timeout=2.0)
-        print("=== 시뮬레이터 종료 완료 ===")
+        for s in streamers:
+            s.join(timeout=1.0)
+        print("=== 시뮬레이터 정상 종료 완료 ===")
 
 
 if __name__ == "__main__":
-    run_ai_simulator()
+    main()
