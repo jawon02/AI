@@ -27,9 +27,9 @@ MODEL_PATH = "best (3).pt"
 
 # Keep the current video-to-camera mapping and backend intersection IDs.
 CAMERAS_CONFIG = {
-    1: {"name": "광주역 교차로", "video_path": "광주역2.mp4", "intersection_id": 1, "direction": "north"},
-    2: {"name": "매봉터널5", "video_path": "매봉터널5.mp4", "intersection_id": 1, "direction": "south"},
-    3: {"name": "서울", "video_path": "서울.mp4", "intersection_id": 1, "direction": "east"},
+    1: {"name": "매봉터널5 ", "video_path": "test1.mp4", "intersection_id": 1, "direction": "north"},
+    2: {"name": "광주역 교차로", "video_path": "test2.mp4", "intersection_id": 1, "direction": "south"},
+    3: {"name": "서울", "video_path": "test3.mp4", "intersection_id": 1, "direction": "east"},
 }
 
 CONF_THRESHOLD = 0.35
@@ -178,14 +178,14 @@ class CameraStreamer(threading.Thread):
                         "intersection_id": self.intersection_id,
                         "camera_id": self.camera_id,
                         "pedestrian_count": 0,
-                        "exit_congested": count > CONGESTION_THRESHOLD,
+                        "exit_congested": False,
                         "accident_detected": bool(metrics["accident_status"]),
                         "emergency_detected": False,
                         # Keep the original backend payload schema/semantics.
                         "north_cars": 0,
                         "south_cars": 0,
-                        "east_cars": int(count * 0.9),
-                        "west_cars": count - int(count * 0.9),
+                        "east_cars": count,
+                        "west_cars": 0,
                         "vehicle_count": count,
                         "image_frame": image_frame,
                     }
