@@ -21,8 +21,8 @@ from ultralytics import YOLO
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SERVER_URL = "https://flickr-speaking-pig-catch.trycloudflare.com/api/control/"
-SERVER_HEALTH_URL = "https://flickr-speaking-pig-catch.trycloudflare.com/docs"
+SERVER_URL = "http://172.20.134.174:8000/api/control/"
+SERVER_HEALTH_URL = "http://172.20.134.174:8000/docs"
 MODEL_PATH = "best (3).pt"
 
 # Keep the current video-to-camera mapping and backend intersection IDs.
