@@ -1,9 +1,8 @@
-"""Optimized YOLO multi-camera traffic simulator.
+"""ROI (관심 영역) 로직 검증 및 시각화용 최적화 multi-camera traffic simulator.
 
-- Processes three video streams with one shared YOLO model.
-- Skips inference when another camera is using the model (no waiting queue).
-- Sends only the latest available annotated frame from a separate sender thread.
-- Uses lower JPEG dimensions/quality and a reduced transmission rate to reduce backend load.
+- 백엔드 연결 없이도 로컬 화면(cv2.imshow) 및 콘솔 로그로 ROI 작동을 직관적으로 확인합니다.
+- 차량 바닥점(Footprint) 기반으로 ROI 영역 내 진입 여부를 판별합니다.
+- ROI 내 차량 수 및 면적 대비 점유율(%)을 실시간으로 계산하여 시각화합니다.
 """
 
 import base64
@@ -19,25 +18,49 @@ import torch
 from ultralytics import YOLO
 
 # ---------------------------------------------------------------------------
-# Configuration
+# 1. 설정 (Configuration)
 # ---------------------------------------------------------------------------
 SERVER_URL = "http://172.20.134.174:8000/api/control/"
 SERVER_HEALTH_URL = "http://172.20.134.174:8000/docs"
 MODEL_PATH = "best (3).pt"
 
-# Keep the current video-to-camera mapping and backend intersection IDs.
+# 카메라별 영상 경로 및 ROI 다각형(Polygon) 좌표 설정
+# [x, y] 형태의 점 4개 이상으로 다각형 영역 지정
 CAMERAS_CONFIG = {
-    1: {"name": "매봉터널5 ", "video_path": "test1.mp4", "intersection_id": 1, "direction": "north"},
-    2: {"name": "광주역 교차로", "video_path": "test2.mp4", "intersection_id": 1, "direction": "south"},
-    3: {"name": "서울", "video_path": "test3.mp4", "intersection_id": 1, "direction": "east"},
+    1: {
+        "name": "매봉터널5",
+        "video_path": "test1.mp4",
+        "intersection_id": 1,
+        "direction": "north",
+        "roi_pts": np.array(
+            [[360, 550], [500, 550], [500, 980], [240, 980]], np.int32
+        ),
+    },
+    2: {
+        "name": "광주역 교차로",
+        "video_path": "test2.mp4",
+        "intersection_id": 1,
+        "direction": "south",
+        "roi_pts": np.array(
+            [[50, 100], [270, 100], [300, 180], [20, 180]], np.int32
+        ),
+    },
+    3: {
+        "name": "서울",
+        "video_path": "test3.mp4",
+        "intersection_id": 1,
+        "direction": "east",
+        "roi_pts": np.array(
+            [[50, 100], [270, 100], [300, 180], [20, 180]], np.int32
+        ),
+    },
 }
 
 CONF_THRESHOLD = 0.35
 INFERENCE_IMAGE_SIZE = 320
 TRACKER_CONFIG = "bytetrack.yaml"
-FRAME_SKIP = 5  # Run inference at most once per 5 source frames per camera.
+FRAME_SKIP = 5  # 5프레임당 1회 추론
 
-# Network: 4 frames/sec per camera, using low-resolution JPEG.
 BACKEND_SEND_INTERVAL_SEC = 0.25
 JPEG_WIDTH = 320
 JPEG_HEIGHT = 180
@@ -45,11 +68,10 @@ JPEG_QUALITY = 40
 
 SMOOTHING_WINDOW = 5
 ACCIDENT_VOTES_REQUIRED = 3
-CONGESTION_THRESHOLD = 15
 FALLBACK_VIDEO_PATH = "광주역교차로.mp4"
 
 # ---------------------------------------------------------------------------
-# Load model
+# 2. 모델 로드 및 웜업
 # ---------------------------------------------------------------------------
 if not Path(MODEL_PATH).exists():
     raise FileNotFoundError(
@@ -58,7 +80,10 @@ if not Path(MODEL_PATH).exists():
     )
 
 for camera_id, config in CAMERAS_CONFIG.items():
-    if not Path(config["video_path"]).exists() and not Path(FALLBACK_VIDEO_PATH).exists():
+    if (
+        not Path(config["video_path"]).exists()
+        and not Path(FALLBACK_VIDEO_PATH).exists()
+    ):
         raise FileNotFoundError(
             f"카메라 {camera_id} 영상 파일을 찾을 수 없습니다: {config['video_path']}\n"
             f"대체 영상도 없습니다: {FALLBACK_VIDEO_PATH}"
@@ -66,22 +91,25 @@ for camera_id, config in CAMERAS_CONFIG.items():
 
 print("=== YOLO 모델 로딩 중... ===")
 model = YOLO(MODEL_PATH)
-# Only one thread is permitted to access the shared YOLO predictor at a time.
-# Threads acquire this lock without waiting, so a busy model never blocks video output.
 model_lock = threading.Lock()
 print("=== YOLO 모델 로딩 완료 ===")
 print("클래스 이름:", model.names)
 
 print("=== 모델 웜업 중... ===")
 with torch.inference_mode():
-    model(np.zeros((320, 320, 3), dtype=np.uint8), imgsz=INFERENCE_IMAGE_SIZE, verbose=False)
+    model(
+        np.zeros((320, 320, 3), dtype=np.uint8),
+        imgsz=INFERENCE_IMAGE_SIZE,
+        verbose=False,
+    )
 print("=== 모델 웜업 완료 ===")
 
 is_running = True
 
 
 def is_car_class(class_name: str) -> bool:
-    return class_name.strip().lower() == "car"
+    name = class_name.strip().lower()
+    return name in ["car", "vehicle", "bus", "truck", "0"]
 
 
 def is_accident_class(class_name: str) -> bool:
@@ -94,8 +122,10 @@ def median_count(history, new_value: int) -> int:
     return int(round(float(np.median(list(history)))))
 
 
+# ---------------------------------------------------------------------------
+# 3. 카메라 스레드 클래스
+# ---------------------------------------------------------------------------
 class CameraStreamer(threading.Thread):
-    """Read/analyze one video; network sending runs independently."""
 
     def __init__(self, camera_id, config, server_online):
         super().__init__(daemon=True, name=f"camera-{camera_id}-processor")
@@ -103,6 +133,7 @@ class CameraStreamer(threading.Thread):
         self.intersection_id = config["intersection_id"]
         self.camera_name = config["name"]
         self.direction = config["direction"]
+        self.roi_pts = config["roi_pts"]
         self.server_online = server_online
 
         requested_path = config["video_path"]
@@ -117,11 +148,9 @@ class CameraStreamer(threading.Thread):
 
         self.total_count_history = deque(maxlen=SMOOTHING_WINDOW)
         self.accident_history = deque(maxlen=SMOOTHING_WINDOW)
-        self.stable_cars = 0
+        self.stable_roi_cars = 0
         self.stable_accident = False
 
-        # Single-slot latest-frame mailbox: old unsent frames are overwritten,
-        # rather than building up a queue and arriving late at the frontend.
         self.latest_lock = threading.Lock()
         self.latest_frame = None
         self.latest_metrics = None
@@ -135,7 +164,7 @@ class CameraStreamer(threading.Thread):
             self.latest_version += 1
 
     def sender_loop(self):
-        """Encode/send the newest frame at a limited rate, independent of inference."""
+        """백엔드 서버로 실시간 프레임 및 메트릭 전송 (독립 스레드)"""
         session = requests.Session()
         last_sent_version = -1
         last_log_time = time.monotonic()
@@ -149,7 +178,10 @@ class CameraStreamer(threading.Thread):
                     continue
 
                 with self.latest_lock:
-                    if self.latest_frame is None or self.latest_metrics is None:
+                    if (
+                        self.latest_frame is None
+                        or self.latest_metrics is None
+                    ):
                         continue
                     version = self.latest_version
                     if version == last_sent_version:
@@ -157,23 +189,28 @@ class CameraStreamer(threading.Thread):
                     frame = self.latest_frame.copy()
                     metrics = dict(self.latest_metrics)
 
-                # Mark the snapshot consumed before network I/O. A newer frame can
-                # replace it while this request is in progress.
                 last_sent_version = version
                 last_log_time = now
 
                 try:
-                    resized = cv2.resize(frame, (JPEG_WIDTH, JPEG_HEIGHT), interpolation=cv2.INTER_AREA)
+                    resized = cv2.resize(
+                        frame,
+                        (JPEG_WIDTH, JPEG_HEIGHT),
+                        interpolation=cv2.INTER_AREA,
+                    )
                     ok, jpeg_buffer = cv2.imencode(
-                        ".jpg", resized,
+                        ".jpg",
+                        resized,
                         [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
                     )
                     if not ok:
-                        print(f"[카메라 {self.camera_id}] JPEG 인코딩 실패")
                         continue
 
-                    image_frame = base64.b64encode(jpeg_buffer.tobytes()).decode("ascii")
-                    count = int(metrics["vehicle_count"])
+                    image_frame = base64.b64encode(jpeg_buffer.tobytes()).decode(
+                        "ascii"
+                    )
+                    roi_count = int(metrics["roi_vehicle_count"])
+
                     payload = {
                         "intersection_id": self.intersection_id,
                         "camera_id": self.camera_id,
@@ -181,32 +218,37 @@ class CameraStreamer(threading.Thread):
                         "exit_congested": False,
                         "accident_detected": bool(metrics["accident_status"]),
                         "emergency_detected": False,
-                        # Keep the original backend payload schema/semantics.
-                        "north_cars": 0,
-                        "south_cars": 0,
-                        "east_cars": count,
-                        "west_cars": 0,
-                        "vehicle_count": count,
+                        "north_cars": (
+                            roi_count if self.direction == "north" else 0
+                        ),
+                        "south_cars": (
+                            roi_count if self.direction == "south" else 0
+                        ),
+                        "east_cars": (
+                            roi_count if self.direction == "east" else 0
+                        ),
+                        "west_cars": (
+                            roi_count if self.direction == "west" else 0
+                        ),
+                        "vehicle_count": roi_count,
                         "image_frame": image_frame,
                     }
 
                     response = session.post(
-                        SERVER_URL,
-                        json=payload,
-                        timeout=(1.0, 2.0),
+                        SERVER_URL, json=payload, timeout=(1.0, 2.0)
                     )
                     response.raise_for_status()
                     successful_sends += 1
-                    if successful_sends == 1 or successful_sends % 20 == 0:
+                    if (
+                        successful_sends == 1
+                        or successful_sends % 20 == 0
+                    ):
                         print(
-                            f"[송출 성공] 카메라={self.camera_id} | "
-                            f"차량={count} | 사고={payload['accident_detected']} | "
-                            f"누적 전송={successful_sends}"
+                            f"[송출 성공] Cam {self.camera_id}({self.direction}) | "
+                            f"ROI 대기 차량: {roi_count}대 | 사고: {payload['accident_detected']}"
                         )
-                except requests.RequestException as exc:
-                    print(f"[카메라 {self.camera_id} 백엔드 전송 실패] {exc}")
-                except Exception as exc:
-                    print(f"[카메라 {self.camera_id} 프레임 인코딩/전송 예외] {exc}")
+                except requests.RequestException:
+                    pass
         finally:
             session.close()
 
@@ -214,7 +256,9 @@ class CameraStreamer(threading.Thread):
         global is_running
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
-            print(f"[오류] 카메라 {self.camera_id} 동영상을 열 수 없습니다: {self.video_path}")
+            print(
+                f"[오류] 카메라 {self.camera_id} 동영상을 열 수 없습니다: {self.video_path}"
+            )
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -223,12 +267,11 @@ class CameraStreamer(threading.Thread):
         frame_delay = 1.0 / fps
         frame_count = 0
         cached_detections = []
-        cached_car_count = 0
+        cached_roi_car_count = 0
         cached_accident = False
 
         print(
-            f"[카메라 {self.camera_id}] {self.camera_name} | "
-            f"영상={self.video_path} | FPS={fps:.1f}"
+            f"[카메라 {self.camera_id}] {self.camera_name} 준비 완료 (영상: {self.video_path})"
         )
 
         if self.server_online:
@@ -238,6 +281,8 @@ class CameraStreamer(threading.Thread):
                 name=f"camera-{self.camera_id}-sender",
             )
             self.sender_thread.start()
+
+        window_name = f"Cam {self.camera_id} - {self.camera_name} (Local Preview)"
 
         try:
             while is_running:
@@ -249,21 +294,22 @@ class CameraStreamer(threading.Thread):
                     if not ret or frame is None:
                         time.sleep(0.1)
                         continue
-                    # Reset temporal smoothing when the video loops.
                     self.total_count_history.clear()
                     self.accident_history.clear()
                     cached_detections = []
-                    cached_car_count = 0
+                    cached_roi_car_count = 0
                     cached_accident = False
-                    self.stable_cars = 0
+                    self.stable_roi_cars = 0
                     self.stable_accident = False
 
                 frame_count += 1
 
-                # Do not wait for the shared model lock. If another camera is
-                # inferencing, this frame is skipped and playback can continue.
-                should_infer = (frame_count % FRAME_SKIP == 0)
-                got_model_lock = should_infer and model_lock.acquire(blocking=False)
+                # 추론 락 체크 (5프레임 주기)
+                should_infer = frame_count % FRAME_SKIP == 0
+                got_model_lock = should_infer and model_lock.acquire(
+                    blocking=False
+                )
+
                 if got_model_lock:
                     try:
                         with torch.inference_mode():
@@ -277,15 +323,18 @@ class CameraStreamer(threading.Thread):
                             )
 
                         frame_detections = []
-                        car_boxes = 0
+                        roi_car_boxes = 0
                         accident_in_frame = False
+
                         for result in results:
                             boxes_obj = result.boxes
                             if boxes_obj is None or len(boxes_obj) == 0:
                                 continue
                             boxes = boxes_obj.xyxy.cpu().numpy()
                             confidences = boxes_obj.conf.cpu().numpy()
-                            class_ids = boxes_obj.cls.cpu().numpy().astype(int)
+                            class_ids = (
+                                boxes_obj.cls.cpu().numpy().astype(int)
+                            )
                             track_ids = (
                                 boxes_obj.id.cpu().numpy().astype(int)
                                 if boxes_obj.id is not None
@@ -296,85 +345,171 @@ class CameraStreamer(threading.Thread):
                                 boxes, confidences, class_ids, track_ids
                             ):
                                 class_name = str(model.names[int(class_id)])
-                                accident_label = is_accident_class(class_name)
-                                frame_detections.append(
-                                    (box.copy(), float(confidence), class_name,
-                                     accident_label, int(track_id))
+                                accident_label = is_accident_class(
+                                    class_name
                                 )
+
+                                # ---------------------------------------------------
+                                # [ROI 핵심 알고리즘] 차량 밑면 중앙점 (Footprint) 산출
+                                # ---------------------------------------------------
+                                x1, y1, x2, y2 = map(int, box)
+                                x_center = int((x1 + x2) / 2)
+                                y_bottom = y2
+                                car_base_point = (x_center, y_bottom)
+
+                                # OpenCV pointPolygonTest 검사 (>=0 이면 영역 내부)
+                                is_in_roi = (
+                                    cv2.pointPolygonTest(
+                                        self.roi_pts, car_base_point, False
+                                    )
+                                    >= 0
+                                )
+
+                                frame_detections.append(
+                                    (
+                                        box.copy(),
+                                        float(confidence),
+                                        class_name,
+                                        accident_label,
+                                        int(track_id),
+                                        car_base_point,
+                                        is_in_roi,
+                                    )
+                                )
+
                                 if accident_label:
                                     accident_in_frame = True
-                                if is_car_class(class_name):
-                                    # Count detected car boxes for this frame. NMS
-                                    # already removes most duplicate detections.
-                                    car_boxes += 1
+
+                                # ROI 구역 내부 차량 카운트
+                                if is_car_class(class_name) and is_in_roi:
+                                    roi_car_boxes += 1
 
                         cached_detections = frame_detections
-                        cached_car_count = car_boxes
+                        cached_roi_car_count = roi_car_boxes
                         cached_accident = accident_in_frame
-                        self.stable_cars = median_count(
-                            self.total_count_history, cached_car_count
+                        self.stable_roi_cars = median_count(
+                            self.total_count_history, cached_roi_car_count
                         )
                         self.accident_history.append(bool(cached_accident))
                         self.stable_accident = (
-                            sum(self.accident_history) >= ACCIDENT_VOTES_REQUIRED
+                            sum(self.accident_history)
+                            >= ACCIDENT_VOTES_REQUIRED
                         )
                     except Exception as exc:
-                        print(f"[카메라 {self.camera_id} AI 추론 예외] {exc}")
+                        print(
+                            f"[카메라 {self.camera_id} AI 추론 예외] {exc}"
+                        )
                     finally:
                         model_lock.release()
 
-                # Draw the most recent inference on the current frame.
-                for box, confidence, class_name, is_accident, track_id in cached_detections:
+                # -----------------------------------------------------------
+                # 로컬 화면 시각화 (GUI 창)
+                # -----------------------------------------------------------
+                # 1. 초록색 ROI 구역 다각형 표시
+                cv2.polylines(
+                    frame,
+                    [self.roi_pts],
+                    isClosed=True,
+                    color=(0, 255, 0),
+                    thickness=2,
+                )
+
+                # 2. 바운딩 박스 및 발바닥점 표시
+                for (
+                    box,
+                    confidence,
+                    class_name,
+                    is_accident,
+                    track_id,
+                    base_pt,
+                    in_roi,
+                ) in cached_detections:
                     x1, y1, x2, y2 = map(int, box)
-                    color = (0, 0, 255) if is_accident else (255, 0, 0)
+                    box_color = (0, 0, 255) if is_accident else (255, 0, 0)
                     id_text = f" ID:{track_id}" if track_id >= 0 else ""
                     label = f"{'accident' if is_accident else class_name} {confidence:.2f}{id_text}"
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                     cv2.putText(
-                        frame, label, (x1, max(y1 - 8, 20)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2,
+                        frame,
+                        label,
+                        (x1, max(y1 - 8, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        (255, 255, 255),
+                        1,
                         cv2.LINE_AA,
                     )
 
+                    # [핵심 visual] ROI 내부 점 = 빨간색 원 / ROI 외부 점 = 파란색 원
+                    pt_color = (0, 0, 255) if in_roi else (255, 0, 0)
+                    cv2.circle(frame, base_pt, 5, pt_color, -1)
+
+                # 3. 상단 대시보드 상태창 바 (ROI 차량 수 및 사고 여부 표시)
                 status_line = (
-                    f"Intersection:{self.intersection_id} | Cam:{self.camera_id} | "
-                    f"Cars:{self.stable_cars} | Accident:{self.stable_accident}"
+                    f"Cam:{self.camera_id}({self.direction}) | "
+                    f"ROI Cars:{self.stable_roi_cars} | Accident:{self.stable_accident}"
                 )
-                cv2.rectangle(frame, (0, 0), (frame.shape[1], 32), (25, 25, 25), -1)
+                cv2.rectangle(
+                    frame, (0, 0), (frame.shape[1], 30), (30, 30, 30), -1
+                )
                 cv2.putText(
-                    frame, status_line, (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, (255, 255, 255), 2, cv2.LINE_AA,
+                    frame,
+                    status_line,
+                    (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    1,
+                    cv2.LINE_AA,
                 )
 
+                # 4. 실시간 콘솔 로그 출력 (카메라 1번 기준 대표 출력)
+                if self.camera_id == 1 and frame_count % 15 == 0:
+                    print(
+                        f"[{self.camera_name}] ROI 내 대기차량: {self.stable_roi_cars}대 | 사고 상태: {self.stable_accident}"
+                    )
+
+                # 5. 로컬 OpenCV 화면 출력
+                cv2.imshow(window_name, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    is_running = False
+                    break
+
                 metrics = {
-                    "vehicle_count": self.stable_cars,
+                    "roi_vehicle_count": self.stable_roi_cars,
                     "accident_status": self.stable_accident,
                 }
                 if self.server_online:
                     self.publish_latest(frame, metrics)
 
-                # Keep playback close to the source FPS when inference allows it.
                 remaining = frame_delay - (time.monotonic() - loop_start)
                 if remaining > 0:
                     time.sleep(remaining)
 
         finally:
             cap.release()
+            cv2.destroyWindow(window_name)
             if self.sender_thread and self.sender_thread.is_alive():
                 self.sender_thread.join(timeout=2.5)
             print(f"[카메라 {self.camera_id}] 종료")
 
 
+# ---------------------------------------------------------------------------
+# 4. 백엔드 연결 상태 체크 및 메인 실행
+# ---------------------------------------------------------------------------
 def check_server():
     print("=== 백엔드 서버 연결 상태 확인 중... ===")
     try:
         response = requests.get(SERVER_HEALTH_URL, timeout=(1.0, 2.0))
         if response.status_code == 200:
-            print("[성공] 백엔드 서버 연결 성공")
+            print("[성공] 백엔드 서버 연결 확인됨 (백엔드 송출 모드)")
             return True
-        print(f"[안내] 서버 응답 코드={response.status_code}. 로컬 모드로 실행합니다.")
-    except requests.RequestException as exc:
-        print(f"[안내] 백엔드 연결 실패: {exc}. 로컬 모드로 실행합니다.")
+        print(
+            f"[안내] 서버 응답 코드={response.status_code}. 로컬 테스트 모드로 실행합니다."
+        )
+    except requests.RequestException:
+        print("[안내] 백엔드 미연결. 로컬 전용 테스트 모드로 실행합니다.")
     return False
 
 
@@ -388,22 +523,23 @@ def main():
         streamers.append(streamer)
         streamer.start()
 
-    print("\n=== 3개 카메라 시뮬레이터 실행 중 (종료: Ctrl+C) ===")
-    print(
-        f"추론: {INFERENCE_IMAGE_SIZE}px, {FRAME_SKIP}프레임마다 시도 | "
-        f"백엔드 전송: 카메라당 최대 {1 / BACKEND_SEND_INTERVAL_SEC:.1f}회/초 | "
-        f"JPEG={JPEG_WIDTH}x{JPEG_HEIGHT}, quality={JPEG_QUALITY}"
-    )
+    print("\n=======================================================")
+    print("🚦 ROI 및 멀티카메라 시뮬레이터 실행 중")
+    print("   - 화면 창에서 초록색 다각형(ROI 구역)을 확인하세요.")
+    print("   - ROI 내부 진입 차량은 [빨간색 점], 외부는 [파란색 점]입니다.")
+    print("   - 종료하려면 영상 창 선택 후 'q' 또는 터미널 Ctrl+C")
+    print("=======================================================\n")
 
     try:
-        while True:
-            time.sleep(1)
+        while is_running:
+            time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n=== 시뮬레이터 종료 요청 ===")
     finally:
         is_running = False
         for streamer in streamers:
             streamer.join(timeout=3.0)
+        cv2.destroyAllWindows()
         print("=== 시뮬레이터 종료 완료 ===")
 
 
