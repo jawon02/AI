@@ -1,8 +1,7 @@
 """ROI (관심 영역) 로직 검증 및 시각화용 최적화 multi-camera traffic simulator.
 
-- 백엔드 연결 없이도 로컬 화면(cv2.imshow) 및 콘솔 로그로 ROI 작동을 직관적으로 확인합니다.
-- 차량 바닥점(Footprint) 기반으로 ROI 영역 내 진입 여부를 판별합니다.
-- ROI 내 차량 수 및 면적 대비 점유율(%)을 실시간으로 계산하여 시각화합니다.
+- 모델 학습 해상도(320px) 및 원본 영상 해상도를 유지합니다.
+- 영상 크기에 종속되지 않도록 상대 비율(0.0~1.0) 기반 동적 ROI 좌표를 적용합니다.
 """
 
 import base64
@@ -24,16 +23,18 @@ SERVER_URL = "http://172.20.134.174:8000/api/control/"
 SERVER_HEALTH_URL = "http://172.20.134.174:8000/docs"
 MODEL_PATH = "best (3).pt"
 
-# 카메라별 영상 경로 및 ROI 다각형(Polygon) 좌표 설정
-# [x, y] 형태의 점 4개 이상으로 다각형 영역 지정
+# [핵심] 픽셀 좌표 대신 비율(0.0 ~ 1.0) 좌표 세팅 (좌상, 우상, 우하, 좌하 순)
+# x_ratio = x / width,  y_ratio = y / height
 CAMERAS_CONFIG = {
     1: {
         "name": "매봉터널5",
         "video_path": "test1.mp4",
         "intersection_id": 1,
         "direction": "north",
-        "roi_pts": np.array(
-            [[360, 550], [500, 550], [500, 980], [240, 980]], np.int32
+        # 매봉터널 왼쪽 정체 차선 감싸는 비율 좌표 (가로/세로 비율)
+        "roi_ratios": np.array(
+            [[0.62, 0.32], [0.76, 0.33], [0.50, 0.98], [0.10, 0.98]],
+            dtype=np.float32,
         ),
     },
     2: {
@@ -41,8 +42,9 @@ CAMERAS_CONFIG = {
         "video_path": "test2.mp4",
         "intersection_id": 1,
         "direction": "south",
-        "roi_pts": np.array(
-            [[50, 100], [270, 100], [300, 180], [20, 180]], np.int32
+        "roi_ratios": np.array(
+            [[0.49, 0.25], [0.61, 0.26], [0.42, 0.98], [0.04, 0.97]],
+            dtype=np.float32,
         ),
     },
     3: {
@@ -50,14 +52,15 @@ CAMERAS_CONFIG = {
         "video_path": "test3.mp4",
         "intersection_id": 1,
         "direction": "east",
-        "roi_pts": np.array(
-            [[50, 100], [270, 100], [300, 180], [20, 180]], np.int32
+        "roi_ratios": np.array(
+            [[0.49, 0.25], [0.50, 0.22], [0.54, 0.98], [0.02, 0.98]],
+            dtype=np.float32,
         ),
     },
 }
 
 CONF_THRESHOLD = 0.35
-INFERENCE_IMAGE_SIZE = 320
+INFERENCE_IMAGE_SIZE = 320  # 학습된 320px 해상도 유지
 TRACKER_CONFIG = "bytetrack.yaml"
 FRAME_SKIP = 5  # 5프레임당 1회 추론
 
@@ -133,7 +136,7 @@ class CameraStreamer(threading.Thread):
         self.intersection_id = config["intersection_id"]
         self.camera_name = config["name"]
         self.direction = config["direction"]
-        self.roi_pts = config["roi_pts"]
+        self.roi_ratios = config["roi_ratios"]
         self.server_online = server_online
 
         requested_path = config["video_path"]
@@ -164,7 +167,6 @@ class CameraStreamer(threading.Thread):
             self.latest_version += 1
 
     def sender_loop(self):
-        """백엔드 서버로 실시간 프레임 및 메트릭 전송 (독립 스레드)"""
         session = requests.Session()
         last_sent_version = -1
         last_log_time = time.monotonic()
@@ -302,9 +304,14 @@ class CameraStreamer(threading.Thread):
                     self.stable_roi_cars = 0
                     self.stable_accident = False
 
+                # [핵심] 영상 원본 크기에 맞춘 동적 ROI 픽셀 좌표 계산
+                h, w = frame.shape[:2]
+                roi_pts = (
+                    self.roi_ratios * np.array([w, h], dtype=np.float32)
+                ).astype(np.int32)
+
                 frame_count += 1
 
-                # 추론 락 체크 (5프레임 주기)
                 should_infer = frame_count % FRAME_SKIP == 0
                 got_model_lock = should_infer and model_lock.acquire(
                     blocking=False
@@ -349,18 +356,15 @@ class CameraStreamer(threading.Thread):
                                     class_name
                                 )
 
-                                # ---------------------------------------------------
-                                # [ROI 핵심 알고리즘] 차량 밑면 중앙점 (Footprint) 산출
-                                # ---------------------------------------------------
                                 x1, y1, x2, y2 = map(int, box)
                                 x_center = int((x1 + x2) / 2)
                                 y_bottom = y2
                                 car_base_point = (x_center, y_bottom)
 
-                                # OpenCV pointPolygonTest 검사 (>=0 이면 영역 내부)
+                                # 동적으로 계산된 roi_pts 적용
                                 is_in_roi = (
                                     cv2.pointPolygonTest(
-                                        self.roi_pts, car_base_point, False
+                                        roi_pts, car_base_point, False
                                     )
                                     >= 0
                                 )
@@ -380,7 +384,6 @@ class CameraStreamer(threading.Thread):
                                 if accident_label:
                                     accident_in_frame = True
 
-                                # ROI 구역 내부 차량 카운트
                                 if is_car_class(class_name) and is_in_roi:
                                     roi_car_boxes += 1
 
@@ -402,19 +405,15 @@ class CameraStreamer(threading.Thread):
                     finally:
                         model_lock.release()
 
-                # -----------------------------------------------------------
-                # 로컬 화면 시각화 (GUI 창)
-                # -----------------------------------------------------------
-                # 1. 초록색 ROI 구역 다각형 표시
+                # 시각화
                 cv2.polylines(
                     frame,
-                    [self.roi_pts],
+                    [roi_pts],
                     isClosed=True,
                     color=(0, 255, 0),
                     thickness=2,
                 )
 
-                # 2. 바운딩 박스 및 발바닥점 표시
                 for (
                     box,
                     confidence,
@@ -441,11 +440,9 @@ class CameraStreamer(threading.Thread):
                         cv2.LINE_AA,
                     )
 
-                    # [핵심 visual] ROI 내부 점 = 빨간색 원 / ROI 외부 점 = 파란색 원
                     pt_color = (0, 0, 255) if in_roi else (255, 0, 0)
                     cv2.circle(frame, base_pt, 5, pt_color, -1)
 
-                # 3. 상단 대시보드 상태창 바 (ROI 차량 수 및 사고 여부 표시)
                 status_line = (
                     f"Cam:{self.camera_id}({self.direction}) | "
                     f"ROI Cars:{self.stable_roi_cars} | Accident:{self.stable_accident}"
@@ -464,13 +461,6 @@ class CameraStreamer(threading.Thread):
                     cv2.LINE_AA,
                 )
 
-                # 4. 실시간 콘솔 로그 출력 (카메라 1번 기준 대표 출력)
-                if self.camera_id == 1 and frame_count % 15 == 0:
-                    print(
-                        f"[{self.camera_name}] ROI 내 대기차량: {self.stable_roi_cars}대 | 사고 상태: {self.stable_accident}"
-                    )
-
-                # 5. 로컬 OpenCV 화면 출력
                 cv2.imshow(window_name, frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     is_running = False
@@ -495,15 +485,12 @@ class CameraStreamer(threading.Thread):
             print(f"[카메라 {self.camera_id}] 종료")
 
 
-# ---------------------------------------------------------------------------
-# 4. 백엔드 연결 상태 체크 및 메인 실행
-# ---------------------------------------------------------------------------
 def check_server():
     print("=== 백엔드 서버 연결 상태 확인 중... ===")
     try:
         response = requests.get(SERVER_HEALTH_URL, timeout=(1.0, 2.0))
         if response.status_code == 200:
-            print("[성공] 백엔드 서버 연결 확인됨 (백엔드 송출 모드)")
+            print("[성공] 백엔드 서버 연결 확인됨")
             return True
         print(
             f"[안내] 서버 응답 코드={response.status_code}. 로컬 테스트 모드로 실행합니다."
@@ -522,13 +509,6 @@ def main():
         streamer = CameraStreamer(camera_id, config, server_online)
         streamers.append(streamer)
         streamer.start()
-
-    print("\n=======================================================")
-    print("🚦 ROI 및 멀티카메라 시뮬레이터 실행 중")
-    print("   - 화면 창에서 초록색 다각형(ROI 구역)을 확인하세요.")
-    print("   - ROI 내부 진입 차량은 [빨간색 점], 외부는 [파란색 점]입니다.")
-    print("   - 종료하려면 영상 창 선택 후 'q' 또는 터미널 Ctrl+C")
-    print("=======================================================\n")
 
     try:
         while is_running:
