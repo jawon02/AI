@@ -1,7 +1,6 @@
-"""ROI (관심 영역) 로직 검증 및 시각화용 최적화 multi-camera traffic simulator.
+"""ROI (관심 영역) 로직 검증 및 시각화용 multi-camera traffic simulator.
 
-- 모델 학습 해상도(320px) 및 원본 영상 해상도를 유지합니다.
-- 영상 크기에 종속되지 않도록 상대 비율(0.0~1.0) 기반 동적 ROI 좌표를 적용합니다.
+- 차량 바운딩 박스가 ROI 다각형 영역과 1픽셀이라도 겹치거나 경계선에 걸치면 ROI 내 차량으로 집계합니다.
 """
 
 import base64
@@ -23,17 +22,14 @@ SERVER_URL = "http://172.20.134.174:8000/api/control/"
 SERVER_HEALTH_URL = "http://172.20.134.174:8000/docs"
 MODEL_PATH = "best (3).pt"
 
-# [핵심] 픽셀 좌표 대신 비율(0.0 ~ 1.0) 좌표 세팅 (좌상, 우상, 우하, 좌하 순)
-# x_ratio = x / width,  y_ratio = y / height
 CAMERAS_CONFIG = {
     1: {
         "name": "매봉터널5",
         "video_path": "test1.mp4",
         "intersection_id": 1,
         "direction": "north",
-        # 매봉터널 왼쪽 정체 차선 감싸는 비율 좌표 (가로/세로 비율)
         "roi_ratios": np.array(
-            [[0.62, 0.32], [0.76, 0.33], [0.50, 0.98], [0.10, 0.98]],
+            [[0.62, 0.35], [0.76, 0.33], [0.50, 0.98], [0.10, 0.98]],
             dtype=np.float32,
         ),
     },
@@ -60,9 +56,9 @@ CAMERAS_CONFIG = {
 }
 
 CONF_THRESHOLD = 0.25
-INFERENCE_IMAGE_SIZE = 640  # 학습된 320px 해상도 유지
+INFERENCE_IMAGE_SIZE = 640
 TRACKER_CONFIG = "bytetrack.yaml"
-FRAME_SKIP = 5  # 5프레임당 1회 추론
+FRAME_SKIP = 5
 
 BACKEND_SEND_INTERVAL_SEC = 0.25
 JPEG_WIDTH = 640
@@ -101,7 +97,7 @@ print("클래스 이름:", model.names)
 print("=== 모델 웜업 중... ===")
 with torch.inference_mode():
     model(
-        np.zeros((320, 320, 3), dtype=np.uint8),
+        np.zeros((640, 640, 3), dtype=np.uint8),
         imgsz=INFERENCE_IMAGE_SIZE,
         verbose=False,
     )
@@ -304,11 +300,14 @@ class CameraStreamer(threading.Thread):
                     self.stable_roi_cars = 0
                     self.stable_accident = False
 
-                # [핵심] 영상 원본 크기에 맞춘 동적 ROI 픽셀 좌표 계산
                 h, w = frame.shape[:2]
                 roi_pts = (
                     self.roi_ratios * np.array([w, h], dtype=np.float32)
                 ).astype(np.int32)
+
+                # ROI 영역 마스크 채우기 (ROI 내부/경계선 픽셀 판단용)
+                roi_mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.fillPoly(roi_mask, [roi_pts], 255)
 
                 frame_count += 1
 
@@ -361,12 +360,14 @@ class CameraStreamer(threading.Thread):
                                 y_bottom = y2
                                 car_base_point = (x_center, y_bottom)
 
-                                # 동적으로 계산된 roi_pts 적용
+                                # 바운딩 박스가 ROI 구역 내부/경계선과 1픽셀이라도 겹치는지 판단
+                                x1_c, y1_c = max(0, x1), max(0, y1)
+                                x2_c, y2_c = min(w, x2), min(h, y2)
+                                sub_roi = roi_mask[y1_c:y2_c, x1_c:x2_c]
                                 is_in_roi = (
-                                    cv2.pointPolygonTest(
-                                        roi_pts, car_base_point, False
-                                    )
-                                    >= 0
+                                    np.any(sub_roi > 0)
+                                    if sub_roi.size > 0
+                                    else False
                                 )
 
                                 frame_detections.append(
@@ -405,7 +406,6 @@ class CameraStreamer(threading.Thread):
                     finally:
                         model_lock.release()
 
-                # 시각화
                 cv2.polylines(
                     frame,
                     [roi_pts],
@@ -440,6 +440,7 @@ class CameraStreamer(threading.Thread):
                         cv2.LINE_AA,
                     )
 
+                    # ROI 내/경계선에 포함된 차량은 빨간 점, 외부는 파란 점 표시
                     pt_color = (0, 0, 255) if in_roi else (255, 0, 0)
                     cv2.circle(frame, base_pt, 5, pt_color, -1)
 
