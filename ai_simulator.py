@@ -1,9 +1,9 @@
-"""Multi-Camera Traffic & Incident Simulator (Async Inference Optimized)
+"""Multi-Camera Traffic & Incident Simulator (Final Optimization)
 
 - 카메라 1 (혼잡): test1.mp4 + best (3).pt (ROI 점유율 +20% 보정)
-- 카메라 2 (사고): accident.mp4 + best_accident.pt (신뢰도 0.50 이상만 사고 인정, 일반 차량 박스 숨김)
-- 카메라 3 (응급차량): emergency.mp4 + best_emergency.pt (신뢰도 0.40 이상만 응급 인정, 일반 차량 박스 숨김)
-- 영상 끊김 방지: AI 추론 연산을 비동기 백그라운드 작업으로 분리하여 비디오 재생 멈춤 완벽 해결
+- 카메라 2 (사고): notest.mp4 + best_accident.pt (사고 전용 모델 단독 구동으로 정속 재생 & 박스동기화 확보)
+- 카메라 3 (응급차량): emergency.mp4 + best_emergency.pt
+- 비동기 추론 오버레이 최적화를 통해 30 FPS 정속 재생 및 박스 위치 매칭 달성
 """
 
 import base64
@@ -28,13 +28,14 @@ CAMERAS_CONFIG = {
     1: {
         "name": "혼잡",
         "video_path": "test1.mp4",
-        "model_path": "best (3).pt",
+        "model_paths": ["best (3).pt"],
         "intersection_id": 1,
         "direction": "north",
         "use_roi": True,
         "draw_cars": True,
         "conf_threshold": 0.25,
         "occupancy_boost": 20.0,
+        "frame_skip": 4,
         "roi_ratios": np.array(
             [[0.62, 0.35], [0.76, 0.33], [0.50, 0.98], [0.10, 0.98]],
             dtype=np.float32,
@@ -42,37 +43,38 @@ CAMERAS_CONFIG = {
     },
     2: {
         "name": "사고",
-        "video_path": "accident.mp4",
-        "model_path": "best_accident.pt",
+        "video_path": "notest.mp4",
+        "model_paths": ["best_accident.pt"],  # 사고 전용 모델 단독 실행으로 속도 병목 완벽 제거
         "intersection_id": 1,
         "direction": "south",
         "use_roi": False,
-        "draw_cars": False,  # 일반 차량 박스 안 그림 (사고만 그림)
-        "conf_threshold": 0.50,  # 0.50 미만 신호등 오탐지 차단
+        "draw_cars": True,
+        "conf_threshold": 0.45,
         "occupancy_boost": 0.0,
+        "frame_skip": 2,  # 2프레임 간격 비동기 추론
         "roi_ratios": None,
     },
     3: {
         "name": "응급차량",
         "video_path": "emergency.mp4",
-        "model_path": "best_emergency.pt",
+        "model_paths": ["best_emergency.pt"],
         "intersection_id": 1,
         "direction": "east",
         "use_roi": False,
-        "draw_cars": False,  # 일반 차량 박스 안 그림 (응급차만 그림)
+        "draw_cars": False,
         "conf_threshold": 0.40,
         "occupancy_boost": 0.0,
+        "frame_skip": 3,
         "roi_ratios": None,
     },
 }
 
-INFERENCE_IMAGE_SIZE = 480
-FRAME_SKIP = 6
+INFERENCE_IMAGE_SIZE = 320  # 추론 속도를 높여 딜레이 제거
 
-BACKEND_SEND_INTERVAL_SEC = 0.25
-JPEG_WIDTH = 640
-JPEG_HEIGHT = 360
-JPEG_QUALITY = 70
+BACKEND_SEND_INTERVAL_SEC = 0.066  # 약 15 FPS 백엔드 송출
+JPEG_WIDTH = 480
+JPEG_HEIGHT = 270
+JPEG_QUALITY = 65
 
 SMOOTHING_WINDOW = 5
 ACCIDENT_VOTES_REQUIRED = 2
@@ -85,7 +87,10 @@ FALLBACK_VIDEO_PATH = "광주역교차로.mp4"
 MODELS = {}
 MODEL_LOCKS = {}
 
-required_models = set(config["model_path"] for config in CAMERAS_CONFIG.values())
+required_models = set()
+for config in CAMERAS_CONFIG.values():
+    for m_path in config["model_paths"]:
+        required_models.add(m_path)
 
 for m_path in required_models:
     if not Path(m_path).exists():
@@ -104,7 +109,7 @@ print("=== 전체 모델 웜업 중... ===")
 with torch.inference_mode():
     for m_path, m_inst in MODELS.items():
         m_inst(
-            np.zeros((480, 480, 3), dtype=np.uint8),
+            np.zeros((320, 320, 3), dtype=np.uint8),
             imgsz=INFERENCE_IMAGE_SIZE,
             verbose=False,
         )
@@ -134,7 +139,7 @@ def median_count(history, new_value: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 3. 카메라 스레드 클래스 (비동기 추론 구조)
+# 3. 카메라 스레드 클래스
 # ---------------------------------------------------------------------------
 class CameraStreamer(threading.Thread):
 
@@ -144,10 +149,11 @@ class CameraStreamer(threading.Thread):
         self.intersection_id = config["intersection_id"]
         self.camera_name = config["name"]
         self.direction = config["direction"]
-        self.model_path = config["model_path"]
+        self.model_paths = config["model_paths"]
         self.use_roi = config["use_roi"]
         self.draw_cars = config["draw_cars"]
         self.conf_threshold = config["conf_threshold"]
+        self.frame_skip = config.get("frame_skip", 2)
         self.roi_ratios = config["roi_ratios"]
         self.occupancy_boost = config.get("occupancy_boost", 0.0)
         self.server_online = server_online
@@ -178,8 +184,8 @@ class CameraStreamer(threading.Thread):
         self.latest_version = 0
         self.sender_thread = None
 
-        # 비동기 추론 관리 변수
         self.infer_lock = threading.Lock()
+        self.cached_detections = []
         self.is_inferring = False
 
     def publish_latest(self, frame, metrics):
@@ -196,7 +202,7 @@ class CameraStreamer(threading.Thread):
 
         try:
             while is_running:
-                time.sleep(0.02)
+                time.sleep(0.01)
                 now = time.monotonic()
                 if now - last_log_time < BACKEND_SEND_INTERVAL_SEC:
                     continue
@@ -274,7 +280,7 @@ class CameraStreamer(threading.Thread):
                     successful_sends += 1
                     if (
                         successful_sends == 1
-                        or successful_sends % 20 == 0
+                        or successful_sends % 50 == 0
                     ):
                         print(
                             f"[송출 성공] Cam {self.camera_id}({self.camera_name}) | "
@@ -287,88 +293,81 @@ class CameraStreamer(threading.Thread):
             session.close()
 
     def _async_inference(self, frame_crop, h, w, roi_mask, total_roi_pixels):
-        """영상 재생 스레드를 멈추지 않는 비동기 AI 추론 함수"""
         try:
-            model_inst = MODELS[self.model_path]
-            model_lock = MODEL_LOCKS[self.model_path]
-
-            with model_lock:
-                with torch.inference_mode():
-                    results = model_inst.predict(
-                        source=frame_crop,
-                        imgsz=INFERENCE_IMAGE_SIZE,
-                        conf=self.conf_threshold,
-                        verbose=False,
-                    )
-
             frame_detections = []
             roi_car_boxes = 0
             accident_in_frame = False
             emergency_in_frame = False
-
             car_mask = np.zeros((h, w), dtype=np.uint8)
 
-            for result in results:
-                boxes_obj = result.boxes
-                if boxes_obj is None or len(boxes_obj) == 0:
-                    continue
-                boxes = boxes_obj.xyxy.cpu().numpy()
-                confidences = boxes_obj.conf.cpu().numpy()
-                class_ids = boxes_obj.cls.cpu().numpy().astype(int)
+            for m_path in self.model_paths:
+                model_inst = MODELS[m_path]
+                model_lock = MODEL_LOCKS[m_path]
 
-                for box, confidence, class_id in zip(
-                    boxes, confidences, class_ids
-                ):
-                    class_name = str(model_inst.names[int(class_id)])
-
-                    is_accident = (
-                        self.camera_id == 2
-                        and is_accident_class(class_name)
-                    )
-                    is_emergency = (
-                        self.camera_id == 3
-                        and is_emergency_class(class_name)
-                    )
-
-                    x1, y1, x2, y2 = map(int, box)
-                    x_center = int((x1 + x2) / 2)
-                    y_bottom = y2
-                    car_base_point = (x_center, y_bottom)
-
-                    if self.use_roi and roi_mask is not None:
-                        x1_c, y1_c = max(0, x1), max(0, y1)
-                        x2_c, y2_c = min(w, x2), min(h, y2)
-                        sub_roi = roi_mask[y1_c:y2_c, x1_c:x2_c]
-                        is_in_roi = (
-                            np.any(sub_roi > 0)
-                            if sub_roi.size > 0
-                            else False
+                with model_lock:
+                    with torch.inference_mode():
+                        results = model_inst.predict(
+                            source=frame_crop,
+                            imgsz=INFERENCE_IMAGE_SIZE,
+                            conf=self.conf_threshold,
+                            verbose=False,
                         )
-                    else:
-                        is_in_roi = False
 
-                    frame_detections.append(
-                        (
-                            box.copy(),
-                            float(confidence),
-                            class_name,
-                            is_accident,
-                            is_emergency,
-                            car_base_point,
-                            is_in_roi,
+                for result in results:
+                    boxes_obj = result.boxes
+                    if boxes_obj is None or len(boxes_obj) == 0:
+                        continue
+                    boxes = boxes_obj.xyxy.cpu().numpy()
+                    confidences = boxes_obj.conf.cpu().numpy()
+                    class_ids = boxes_obj.cls.cpu().numpy().astype(int)
+
+                    for box, confidence, class_id in zip(
+                        boxes, confidences, class_ids
+                    ):
+                        class_name = str(model_inst.names[int(class_id)])
+
+                        is_accident = is_accident_class(class_name) if "accident" in m_path else False
+                        is_emergency = is_emergency_class(class_name) if "emergency" in m_path else False
+
+                        x1, y1, x2, y2 = map(int, box)
+                        x_center = int((x1 + x2) / 2)
+                        y_bottom = y2
+                        car_base_point = (x_center, y_bottom)
+
+                        if self.use_roi and roi_mask is not None:
+                            x1_c, y1_c = max(0, x1), max(0, y1)
+                            x2_c, y2_c = min(w, x2), min(h, y2)
+                            sub_roi = roi_mask[y1_c:y2_c, x1_c:x2_c]
+                            is_in_roi = (
+                                np.any(sub_roi > 0)
+                                if sub_roi.size > 0
+                                else False
+                            )
+                        else:
+                            is_in_roi = False
+
+                        frame_detections.append(
+                            (
+                                box.copy(),
+                                float(confidence),
+                                class_name,
+                                is_accident,
+                                is_emergency,
+                                car_base_point,
+                                is_in_roi,
+                            )
                         )
-                    )
 
-                    if is_accident:
-                        accident_in_frame = True
-                    if is_emergency:
-                        emergency_in_frame = True
+                        if is_accident:
+                            accident_in_frame = True
+                        if is_emergency:
+                            emergency_in_frame = True
 
-                    if self.use_roi and is_car_class(class_name) and is_in_roi:
-                        roi_car_boxes += 1
-                        cv2.rectangle(
-                            car_mask, (x1_c, y1_c), (x2_c, y2_c), 255, -1
-                        )
+                        if self.use_roi and is_car_class(class_name) and is_in_roi:
+                            roi_car_boxes += 1
+                            cv2.rectangle(
+                                car_mask, (x1_c, y1_c), (x2_c, y2_c), 255, -1
+                            )
 
             if self.use_roi and total_roi_pixels > 0:
                 overlap_mask = cv2.bitwise_and(car_mask, roi_mask)
@@ -384,14 +383,8 @@ class CameraStreamer(threading.Thread):
             else:
                 current_occupancy = 0.0
 
-            # 결과 업데이트
             with self.infer_lock:
                 self.cached_detections = frame_detections
-                self.cached_roi_car_count = roi_car_boxes
-                self.cached_occupancy_rate = current_occupancy
-                self.cached_accident = accident_in_frame
-                self.cached_emergency = emergency_in_frame
-
                 self.stable_roi_cars = median_count(
                     self.total_count_history, roi_car_boxes
                 )
@@ -429,14 +422,14 @@ class CameraStreamer(threading.Thread):
         frame_count = 0
 
         self.cached_detections = []
-        self.cached_roi_car_count = 0
-        self.cached_occupancy_rate = 0.0
-        self.cached_accident = False
-        self.cached_emergency = False
+        self.stable_roi_cars = 0
+        self.stable_occupancy_rate = 0.0
+        self.stable_accident = False
+        self.stable_emergency = False
 
         print(
             f"[카메라 {self.camera_id}] {self.camera_name} 준비 완료 "
-            f"(영상: {self.video_path}, 모델: {self.model_path}, 임계값: {self.conf_threshold})"
+            f"(영상: {self.video_path}, 모델: {self.model_paths}, 스킵: {self.frame_skip})"
         )
 
         if self.server_online:
@@ -446,8 +439,6 @@ class CameraStreamer(threading.Thread):
                 name=f"camera-{self.camera_id}-sender",
             )
             self.sender_thread.start()
-
-        window_name = f"Cam {self.camera_id} - {self.camera_name}"
 
         try:
             while is_running:
@@ -476,8 +467,8 @@ class CameraStreamer(threading.Thread):
 
                 frame_count += 1
 
-                # 비동기 AI 추론 요청 (영상 재생 멈춤 방지)
-                if frame_count % FRAME_SKIP == 0 and not self.is_inferring:
+                # 비동기 AI 추론 호출 (동영상 재생 타이밍 방해 금지)
+                if frame_count % self.frame_skip == 0 and not self.is_inferring:
                     self.is_inferring = True
                     threading.Thread(
                         target=self._async_inference,
@@ -485,7 +476,7 @@ class CameraStreamer(threading.Thread):
                         daemon=True,
                     ).start()
 
-                # ROI 표시 (카메라 1번만)
+                # ROI 영역 시각화
                 if self.use_roi and roi_pts is not None:
                     cv2.polylines(
                         frame,
@@ -495,7 +486,6 @@ class CameraStreamer(threading.Thread):
                         thickness=2,
                     )
 
-                # 시각화 (락 처리하여 안전하게 참조)
                 with self.infer_lock:
                     detections_to_draw = list(self.cached_detections)
 
@@ -508,7 +498,6 @@ class CameraStreamer(threading.Thread):
                     base_pt,
                     in_roi,
                 ) in detections_to_draw:
-                    # 사고/응급 탐지 전용 카메라의 경우 일반 차량 박스 표출 스킵
                     if not self.draw_cars and not is_accident and not is_emergency:
                         continue
 
@@ -539,7 +528,7 @@ class CameraStreamer(threading.Thread):
                         pt_color = (0, 0, 255) if in_roi else (255, 0, 0)
                         cv2.circle(frame, base_pt, 5, pt_color, -1)
 
-                # 상단 상태바 표기
+                # 상단 오버레이 정보바
                 ratio_val = round(self.stable_occupancy_rate / 100.0, 2)
                 status_line = (
                     f"Cam:{self.camera_id}({self.camera_name}) | "
@@ -560,11 +549,6 @@ class CameraStreamer(threading.Thread):
                     cv2.LINE_AA,
                 )
 
-                cv2.imshow(window_name, frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    is_running = False
-                    break
-
                 metrics = {
                     "roi_vehicle_count": self.stable_roi_cars,
                     "occupancy_rate": self.stable_occupancy_rate,
@@ -580,7 +564,6 @@ class CameraStreamer(threading.Thread):
 
         finally:
             cap.release()
-            cv2.destroyWindow(window_name)
             if self.sender_thread and self.sender_thread.is_alive():
                 self.sender_thread.join(timeout=2.5)
             print(f"[카메라 {self.camera_id}] 종료")
@@ -620,7 +603,6 @@ def main():
         is_running = False
         for streamer in streamers:
             streamer.join(timeout=3.0)
-        cv2.destroyAllWindows()
         print("=== 시뮬레이터 종료 완료 ===")
 
 
