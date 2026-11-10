@@ -1,6 +1,7 @@
-"""ROI (관심 영역) 로직 검증 및 시각화용 multi-camera traffic simulator.
+"""ROI (관심 영역) 순수 픽셀 면적 대비 점유율(Occupancy Rate) 산출 multi-camera traffic simulator.
 
-- 차량 바운딩 박스가 ROI 다각형 영역과 1픽셀이라도 겹치거나 경계선에 걸치면 ROI 내 차량으로 집계합니다.
+- 수식: (ROI 내 차량 픽셀 합집합 / 전체 ROI 픽셀) * 100
+- 억지 가중치 없이 ROI 다각형 내부의 실제 차체 픽셀 점유 비율을 정직하고 정밀하게 산출합니다.
 """
 
 import base64
@@ -146,8 +147,11 @@ class CameraStreamer(threading.Thread):
             self.video_path = FALLBACK_VIDEO_PATH
 
         self.total_count_history = deque(maxlen=SMOOTHING_WINDOW)
+        self.occupancy_history = deque(maxlen=SMOOTHING_WINDOW)
         self.accident_history = deque(maxlen=SMOOTHING_WINDOW)
+
         self.stable_roi_cars = 0
+        self.stable_occupancy_rate = 0.0
         self.stable_accident = False
 
         self.latest_lock = threading.Lock()
@@ -208,6 +212,7 @@ class CameraStreamer(threading.Thread):
                         "ascii"
                     )
                     roi_count = int(metrics["roi_vehicle_count"])
+                    occupancy = float(metrics["occupancy_rate"])
 
                     payload = {
                         "intersection_id": self.intersection_id,
@@ -243,7 +248,7 @@ class CameraStreamer(threading.Thread):
                     ):
                         print(
                             f"[송출 성공] Cam {self.camera_id}({self.direction}) | "
-                            f"ROI 대기 차량: {roi_count}대 | 사고: {payload['accident_detected']}"
+                            f"ROI 차량: {roi_count}대 | 순수 면적 점유율: {occupancy:.1f}% | 사고: {payload['accident_detected']}"
                         )
                 except requests.RequestException:
                     pass
@@ -266,6 +271,7 @@ class CameraStreamer(threading.Thread):
         frame_count = 0
         cached_detections = []
         cached_roi_car_count = 0
+        cached_occupancy_rate = 0.0
         cached_accident = False
 
         print(
@@ -293,11 +299,14 @@ class CameraStreamer(threading.Thread):
                         time.sleep(0.1)
                         continue
                     self.total_count_history.clear()
+                    self.occupancy_history.clear()
                     self.accident_history.clear()
                     cached_detections = []
                     cached_roi_car_count = 0
+                    cached_occupancy_rate = 0.0
                     cached_accident = False
                     self.stable_roi_cars = 0
+                    self.stable_occupancy_rate = 0.0
                     self.stable_accident = False
 
                 h, w = frame.shape[:2]
@@ -305,9 +314,10 @@ class CameraStreamer(threading.Thread):
                     self.roi_ratios * np.array([w, h], dtype=np.float32)
                 ).astype(np.int32)
 
-                # ROI 영역 마스크 채우기 (ROI 내부/경계선 픽셀 판단용)
+                # 1. 전체 ROI 다각형 픽셀 수 산출 (분모)
                 roi_mask = np.zeros((h, w), dtype=np.uint8)
                 cv2.fillPoly(roi_mask, [roi_pts], 255)
+                total_roi_pixels = cv2.countNonZero(roi_mask)
 
                 frame_count += 1
 
@@ -331,6 +341,9 @@ class CameraStreamer(threading.Thread):
                         frame_detections = []
                         roi_car_boxes = 0
                         accident_in_frame = False
+
+                        # 차량 박스 마스크 캔버스
+                        car_mask = np.zeros((h, w), dtype=np.uint8)
 
                         for result in results:
                             boxes_obj = result.boxes
@@ -360,7 +373,7 @@ class CameraStreamer(threading.Thread):
                                 y_bottom = y2
                                 car_base_point = (x_center, y_bottom)
 
-                                # 바운딩 박스가 ROI 구역 내부/경계선과 1픽셀이라도 겹치는지 판단
+                                # ROI 다각형 내부/경계선 겹침 판단
                                 x1_c, y1_c = max(0, x1), max(0, y1)
                                 x2_c, y2_c = min(w, x2), min(h, y2)
                                 sub_roi = roi_mask[y1_c:y2_c, x1_c:x2_c]
@@ -387,13 +400,36 @@ class CameraStreamer(threading.Thread):
 
                                 if is_car_class(class_name) and is_in_roi:
                                     roi_car_boxes += 1
+                                    # ROI 내 차량 영역 흰색(255) 채우기 (중복 박스 자동 합집합)
+                                    cv2.rectangle(
+                                        car_mask, (x1_c, y1_c), (x2_c, y2_c), 255, -1
+                                    )
+
+                        # 2. ROI 구역 밖으로 나간 박스 자르기 & ROI 내 순수 차량 픽셀 수 산출 (분자)
+                        overlap_mask = cv2.bitwise_and(car_mask, roi_mask)
+                        car_roi_pixels = cv2.countNonZero(overlap_mask)
+
+                        # 3. 정직한 순수 ROI 면적 점유율 산출 (%)
+                        current_occupancy = (
+                            (car_roi_pixels / total_roi_pixels) * 100.0
+                            if total_roi_pixels > 0
+                            else 0.0
+                        )
 
                         cached_detections = frame_detections
                         cached_roi_car_count = roi_car_boxes
+                        cached_occupancy_rate = current_occupancy
                         cached_accident = accident_in_frame
+
+                        # 차량 대수 및 점유율 스무딩 (중앙값 연산)
                         self.stable_roi_cars = median_count(
                             self.total_count_history, cached_roi_car_count
                         )
+                        self.occupancy_history.append(float(cached_occupancy_rate))
+                        self.stable_occupancy_rate = round(
+                            float(np.median(list(self.occupancy_history))), 1
+                        )
+
                         self.accident_history.append(bool(cached_accident))
                         self.stable_accident = (
                             sum(self.accident_history)
@@ -406,6 +442,7 @@ class CameraStreamer(threading.Thread):
                     finally:
                         model_lock.release()
 
+                # ROI 초록색 다각형 표시
                 cv2.polylines(
                     frame,
                     [roi_pts],
@@ -440,13 +477,14 @@ class CameraStreamer(threading.Thread):
                         cv2.LINE_AA,
                     )
 
-                    # ROI 내/경계선에 포함된 차량은 빨간 점, 외부는 파란 점 표시
                     pt_color = (0, 0, 255) if in_roi else (255, 0, 0)
                     cv2.circle(frame, base_pt, 5, pt_color, -1)
 
+                # 상단 상태바에 순수 면적 점유율 표기
                 status_line = (
                     f"Cam:{self.camera_id}({self.direction}) | "
-                    f"ROI Cars:{self.stable_roi_cars} | Accident:{self.stable_accident}"
+                    f"ROI Cars:{self.stable_roi_cars} ({self.stable_occupancy_rate:.1f}%) | "
+                    f"Accident:{self.stable_accident}"
                 )
                 cv2.rectangle(
                     frame, (0, 0), (frame.shape[1], 30), (30, 30, 30), -1
@@ -469,6 +507,7 @@ class CameraStreamer(threading.Thread):
 
                 metrics = {
                     "roi_vehicle_count": self.stable_roi_cars,
+                    "occupancy_rate": self.stable_occupancy_rate,
                     "accident_status": self.stable_accident,
                 }
                 if self.server_online:
