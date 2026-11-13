@@ -1,9 +1,9 @@
-"""Multi-Camera Traffic & Incident Simulator (Final Optimization)
+"""Multi-Camera Traffic & Incident Simulator (4 Cameras Configuration)
 
-- 카메라 1 (혼잡): test1.mp4 + best (3).pt (ROI 점유율 +20% 보정)
-- 카메라 2 (사고): notest.mp4 + best_accident.pt (사고 전용 모델 단독 구동으로 정속 재생 & 박스동기화 확보)
-- 카메라 3 (응급차량): emergency.mp4 + best_emergency.pt
-- 비동기 추론 오버레이 최적화를 통해 30 FPS 정속 재생 및 박스 위치 매칭 달성
+- 카메라 1 (혼잡): test1.mp4 + best (3).pt (ROI 사용)
+- 카메라 2 (사고): notest.mp4 + best_accident.pt (사고 전용)
+- 카메라 3 (응급차량): emergency.mp4 + best_emergency.pt (응급 전용)
+- 카메라 4 (일반): Normal.mp4 + best (3).pt (ROI 사용)
 """
 
 import base64
@@ -44,20 +44,20 @@ CAMERAS_CONFIG = {
     2: {
         "name": "사고",
         "video_path": "notest.mp4",
-        "model_paths": ["best_accident.pt"],  # 사고 전용 모델 단독 실행으로 속도 병목 완벽 제거
+        "model_paths": ["best_accident.pt"],  # 사고 전용 모델 단독 실행
         "intersection_id": 1,
         "direction": "south",
         "use_roi": False,
         "draw_cars": True,
         "conf_threshold": 0.45,
         "occupancy_boost": 0.0,
-        "frame_skip": 2,  # 2프레임 간격 비동기 추론
+        "frame_skip": 2,
         "roi_ratios": None,
     },
     3: {
         "name": "응급차량",
         "video_path": "emergency.mp4",
-        "model_paths": ["best_emergency.pt"],
+        "model_paths": ["best_emergency.pt"],  # 응급 전용 모델 단독 실행
         "intersection_id": 1,
         "direction": "east",
         "use_roi": False,
@@ -66,6 +66,22 @@ CAMERAS_CONFIG = {
         "occupancy_boost": 0.0,
         "frame_skip": 3,
         "roi_ratios": None,
+    },
+    4: {
+        "name": "일반",
+        "video_path": "Normal.mp4",
+        "model_paths": ["best (3).pt"],  # 카메라 4번: Normal.mp4 + best (3).pt + ROI 사용
+        "intersection_id": 1,
+        "direction": "west",
+        "use_roi": True,
+        "draw_cars": True,
+        "conf_threshold": 0.25,
+        "occupancy_boost": 0.0,
+        "frame_skip": 4,
+        "roi_ratios": np.array(
+            [[0.30, 0.26], [0.35, 0.25], [0.49, 0.67], [0.32, 0.80]],
+            dtype=np.float32,
+        ),
     },
 }
 
